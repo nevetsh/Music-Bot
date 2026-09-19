@@ -4,3 +4,4 @@ PyNaCl
 python-dotenv
 requests
 msgspec
+yt-dlp

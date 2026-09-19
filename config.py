@@ -28,7 +28,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 COMMANDS = {
     "play": {
         "aliases": ["p"],
-        "description": "Play a YouTube track or search",
+        "description": "Play a YouTube or SoundCloud track, search, or playlist",
     },
     "search": {
         "aliases": [],
@@ -37,6 +37,10 @@ COMMANDS = {
     "searchspotify": {
         "aliases": ["ssearch", "spotifysearch"],
         "description": "Search Spotify and pick a track",
+    },
+    "searchsoundcloud": {
+        "aliases": ["scsearch", "soundcloudsearch"],
+        "description": "Search SoundCloud and pick a track",
     },
     "insert": {
         "aliases": ["i"],
@@ -115,7 +119,10 @@ for _cmd, _meta in COMMANDS.items():
 
 def resolve_command(name: str) -> str | None:
     """Return the primary command name for an alias or raw input, or None."""
-    key = name.lstrip("!").lower()
+    key = name.strip()
+    if BOT_PREFIX and key.startswith(BOT_PREFIX):
+        key = key[len(BOT_PREFIX):]
+    key = key.lower()
     if key in COMMANDS:
         return key
     return ALIAS_TO_COMMAND.get(key)

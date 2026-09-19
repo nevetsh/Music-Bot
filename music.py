@@ -5,7 +5,9 @@ Requirements (see modules/assets/requirements.txt):
 - pip install pytubefix PyNaCl
 - An ffmpeg binary on PATH (or set the FFMPEG_BINARY env var to its full path)
 
-Commands: `!play <link|search>`, `!skip`, `!stop`, `!leave`, `!join`, `!loop`, `!queue`, `!pause`, `!resume`, `!nowplaying`, `!dj <role>`
+Commands use the configured BOT_PREFIX (see config.py): play, search,
+searchspotify, searchsoundcloud, skip, stop, leave, join, loop, queue, pause,
+resume, nowplaying, dj.
 """
 
 import asyncio
@@ -19,7 +21,7 @@ import discord
 import pytubefix as ptf
 from discord.ext import commands, tasks
 
-from config import SUPER_ADMIN_ID, MUSIC_EMPTY_CHANNEL_TIMEOUT, MUSIC_VOICE_CONNECT_TIMEOUT, MUSIC_VOTE_REQUIRED_RATIO
+from config import SUPER_ADMIN_ID, BOT_PREFIX, MUSIC_EMPTY_CHANNEL_TIMEOUT, MUSIC_VOICE_CONNECT_TIMEOUT, MUSIC_VOTE_REQUIRED_RATIO
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -256,6 +258,43 @@ def _spotify_search_query(track_title: str, artists: str) -> str:
     return f"{track_title} {artists}".strip()
 
 
+# ---------- SoundCloud support ----------
+# SoundCloud audio is resolved with yt-dlp. Queue entries keep the public URL
+# and resolve the short-lived stream URL only when playback starts.
+_SOUNDCLOUD_URL_RE = re.compile(r"https?://(?:www\.)?soundcloud\.com/[^\s<>]+", re.IGNORECASE)
+
+
+def _is_soundcloud_url(value: str) -> bool:
+    return bool(_SOUNDCLOUD_URL_RE.search(value or ""))
+
+
+def _is_soundcloud_playlist_url(value: str) -> bool:
+    lowered = (value or "").lower()
+    return _is_soundcloud_url(value) and any(
+        marker in lowered
+        for marker in ("/sets/", "/albums/", "/playlists/", "/likes", "/reposts")
+    )
+
+
+def _soundcloud_info(query: str, *, flat: bool = False, playlist: bool = False) -> dict | None:
+    """Extract SoundCloud metadata or a playable stream using yt-dlp."""
+    try:
+        import yt_dlp
+
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": flat,
+            "noplaylist": not playlist,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(query, download=False)
+    except Exception as exc:
+        print(f"[music] soundcloud resolve failed for {query!r}: {exc!r}")
+        return None
+
+
 # ffmpeg: keep the connection alive on live streams, strip video.
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -275,6 +314,40 @@ class _ResumeCtx:
     async def send(self, *args, **kwargs):
         if self.channel is not None:
             await self.channel.send(*args, **kwargs)
+
+
+class MusicControlView(discord.ui.View):
+    """Interactive controls attached to now-playing and queue messages."""
+
+    def __init__(self, cog, guild_id: int, *, queue_view: bool = False):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.queue_view = queue_view
+        self.now_playing_button.label = "Show Now Playing" if queue_view else "Show Queue"
+
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.success)
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog._button_pause(interaction, self)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.primary)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog._button_previous(interaction, self)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary)
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog._button_skip(interaction, self)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog._button_stop(interaction, self)
+
+    @discord.ui.button(label="Show Now Playing", style=discord.ButtonStyle.secondary)
+    async def now_playing_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.queue_view:
+            await self.cog._button_show_now_playing(interaction, self)
+        else:
+            await self.cog._button_show_queue(interaction, self)
 
 
 class Music(commands.Cog):
@@ -352,8 +425,8 @@ class Music(commands.Cog):
         state["voice"] = None
         state["source"] = None
 
-    def _persist(self) -> None:
-        """Snapshot live playback (position, channel) and save all guild states."""
+    async def _persist(self) -> None:
+        """Snapshot live playback and save state without blocking the event loop."""
         now = time.monotonic()
         for state in self.states.values():
             voice = state.get("voice")
@@ -367,16 +440,31 @@ class Music(commands.Cog):
                 state["started_at"] = now
             if voice is not None and voice.is_connected() and getattr(voice, "channel", None):
                 state["channel_id"] = voice.channel.id
-        _save_music_state(self.states)
+        # JSON serialization and disk I/O can block when queues are large.
+        snapshot = {
+            guild_id: {
+                "queue": [dict(track) for track in state.get("queue", [])],
+                "current": dict(state["current"]) if state.get("current") else None,
+                "last_played": dict(state["last_played"]) if state.get("last_played") else None,
+                "loop": state.get("loop", "off"),
+                "volume": state.get("volume", 1.0),
+                "elapsed": state.get("elapsed", 0.0),
+                "channel_id": state.get("channel_id"),
+                "text_channel_id": state.get("text_channel_id"),
+                "paused": bool(state.get("paused")),
+            }
+            for guild_id, state in self.states.items()
+        }
+        await asyncio.to_thread(_save_music_state, snapshot)
 
-    def persist_now(self) -> None:
+    async def persist_now(self) -> None:
         """Save immediately with the freshest position - used before restart."""
-        self._persist()
+        await self._persist()
 
     @tasks.loop(seconds=10)
     async def _persist_loop(self):
         try:
-            self._persist()
+            await self._persist()
         except Exception as exc:
             print(f"[music] state persist failed: {exc!r}")
 
@@ -480,6 +568,161 @@ class Music(commands.Cog):
     def _loop_label(self, mode: str) -> str:
         return {"off": "Off", "track": "Track", "queue": "Queue"}.get(mode, "Off")
 
+    def _voice_for_guild(self, guild_id: int):
+        for voice in self.bot.voice_clients:
+            if getattr(voice, "guild", None) and voice.guild.id == guild_id:
+                return voice
+        return None
+
+    def _member_can_control(self, guild, member) -> bool:
+        if guild is None or member is None:
+            return False
+        permissions = getattr(member, "guild_permissions", None)
+        if permissions and permissions.manage_guild:
+            return True
+        if getattr(member, "id", None) == SUPER_ADMIN_ID:
+            return True
+        dj_role_id = self.dj_roles.get(guild.id)
+        return bool(dj_role_id and any(role.id == dj_role_id for role in getattr(member, "roles", [])))
+
+    async def _interaction_error(self, interaction: discord.Interaction, message: str):
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+    async def _edit_control_message(self, interaction: discord.Interaction, *, queue_view: bool = False):
+        embed = self._queue_embed(self.guild_id_from_interaction(interaction)) if queue_view else self._now_playing_embed(self.guild_id_from_interaction(interaction))
+        view = MusicControlView(self, self.guild_id_from_interaction(interaction), queue_view=queue_view)
+        if interaction.response.is_done():
+            await interaction.message.edit(embed=embed, view=view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=view)
+
+    @staticmethod
+    def guild_id_from_interaction(interaction: discord.Interaction) -> int:
+        return interaction.guild.id
+
+    def _queue_embed(self, guild_id: int) -> discord.Embed:
+        state = self.get_state(guild_id)
+        lines = [f"**Up next ({len(state['queue'])}):**"]
+        if not state["queue"]:
+            lines.append("Queue is empty.")
+        else:
+            for i, track in enumerate(state["queue"], start=1):
+                duration = f" ({self._fmt_duration(track['duration'])})" if track.get("duration") else ""
+                requester = f" • {track.get('requester', 'Unknown')}" if track.get("requester") else ""
+                lines.append(f"**{i}.** {track['title']}{duration}{requester}")
+        return discord.Embed(title="🎵 Music Queue", description="\n".join(lines), color=0x00AAFF)
+
+    async def _button_pause(self, interaction: discord.Interaction, view: MusicControlView):
+        if not self._member_can_control(interaction.guild, interaction.user):
+            await self._interaction_error(interaction, "You need the configured DJ role or Manage Server permission to pause playback.")
+            return
+        voice = self._voice_for_guild(interaction.guild.id)
+        state = self.get_state(interaction.guild.id)
+        if voice and voice.is_playing():
+            state["elapsed"] = self._elapsed_seconds(state)
+            state["started_at"] = None
+            state["paused"] = True
+            voice.pause()
+        elif voice and voice.is_paused():
+            state["started_at"] = time.monotonic()
+            state["paused"] = False
+            voice.resume()
+        else:
+            await self._interaction_error(interaction, "Nothing is playing.")
+            return
+        await self._edit_control_message(interaction)
+
+    async def _button_previous(self, interaction: discord.Interaction, view: MusicControlView):
+        if not self._member_can_control(interaction.guild, interaction.user):
+            await self._interaction_error(interaction, "You need the configured DJ role or Manage Server permission to use Previous.")
+            return
+        state = self.get_state(interaction.guild.id)
+        previous = state.get("last_played")
+        voice = self._voice_for_guild(interaction.guild.id)
+        if previous is None:
+            await self._interaction_error(interaction, "There is no previous song to play.")
+            return
+        if voice is None or not voice.is_connected():
+            await self._interaction_error(interaction, "I'm not in a voice channel.")
+            return
+        state["queue"].insert(0, dict(previous))
+        state["suppress_loop"] = True
+        state["control_message"] = interaction.message
+        if voice and (voice.is_playing() or voice.is_paused()):
+            voice.stop()
+            await interaction.response.defer()
+        else:
+            shim = _ResumeCtx(interaction.guild, voice, interaction.channel)
+            await self._play_next(shim)
+            await self._edit_control_message(interaction)
+
+    async def _button_skip(self, interaction: discord.Interaction, view: MusicControlView):
+        voice = self._voice_for_guild(interaction.guild.id)
+        if voice is None or not voice.is_connected():
+            await self._interaction_error(interaction, "I'm not in a voice channel.")
+            return
+        if self._member_can_control(interaction.guild, interaction.user):
+            state = self.get_state(interaction.guild.id)
+            if voice.is_playing() or voice.is_paused():
+                state["suppress_loop"] = True
+                state["control_message"] = interaction.message
+                voice.stop()
+                await interaction.response.defer()
+            elif state["queue"]:
+                await interaction.response.defer()
+                await self._play_next(_ResumeCtx(interaction.guild, voice, interaction.channel))
+                await self._edit_control_message(interaction)
+            else:
+                await self._interaction_error(interaction, "Nothing is playing and the queue is empty.")
+            return
+        await interaction.response.defer()
+        await self._start_vote(
+            interaction.guild.id,
+            "skip",
+            interaction.user.id,
+            lambda content: interaction.followup.send(content, wait=True),
+        )
+
+    async def _button_stop(self, interaction: discord.Interaction, view: MusicControlView):
+        voice = self._voice_for_guild(interaction.guild.id)
+        if voice is None or not voice.is_connected():
+            await self._interaction_error(interaction, "I'm not in a voice channel.")
+            return
+        if not self._member_can_control(interaction.guild, interaction.user):
+            await interaction.response.defer()
+            await self._start_vote(
+                interaction.guild.id,
+                "leave",
+                interaction.user.id,
+                lambda content: interaction.followup.send(content, wait=True),
+            )
+            return
+        state = self.get_state(interaction.guild.id)
+        state["queue"].clear()
+        state["suppress_loop"] = True
+        state["loop"] = "off"
+        if voice.is_playing() or voice.is_paused():
+            voice.stop()
+        await voice.disconnect()
+        self._reset_playback_state(state)
+        state["last_played"] = None
+        self._clear_resume_markers(state)
+        await self._persist()
+        if interaction.response.is_done():
+            await interaction.message.edit(content="👋 Left the voice channel and cleared the queue.", embed=None, view=None)
+        else:
+            await interaction.response.edit_message(content="👋 Left the voice channel and cleared the queue.", embed=None, view=None)
+        self._cancel_empty_timer(interaction.guild.id)
+
+    async def _button_show_queue(self, interaction: discord.Interaction, view: MusicControlView):
+        await self._edit_control_message(interaction, queue_view=True)
+
+    async def _button_show_now_playing(self, interaction: discord.Interaction, view: MusicControlView):
+        await self._edit_control_message(interaction, queue_view=False)
+
     def _now_playing_embed(self, guild_id: int) -> discord.Embed | None:
         state = self.get_state(guild_id)
         current = state.get("current")
@@ -502,9 +745,19 @@ class Music(commands.Cog):
         return embed
 
     async def _send_now_playing(self, ctx):
-        embed = self._now_playing_embed(ctx.guild.id)
-        if embed is not None:
-            await ctx.send(embed=embed)
+        guild_id = ctx.guild.id
+        embed = self._now_playing_embed(guild_id)
+        if embed is None:
+            return
+        view = MusicControlView(self, guild_id)
+        control_message = self.get_state(guild_id).pop("control_message", None)
+        if control_message is not None:
+            try:
+                await control_message.edit(embed=embed, view=view)
+                return
+            except discord.HTTPException:
+                pass
+        await ctx.send(embed=embed, view=view)
 
     def _get_human_voice_members(self, ctx):
         """Return list of non-bot members in the bot's current voice channel."""
@@ -512,6 +765,32 @@ class Music(commands.Cog):
         if voice is None or not voice.is_connected() or not voice.channel:
             return []
         return [m for m in voice.channel.members if not m.bot]
+
+    async def _start_vote(self, guild_id: int, action: str, starter_id: int, send):
+        """Create a reaction vote for a button or prefix/slash command."""
+        voice = self._voice_for_guild(guild_id)
+        humans = [member for member in getattr(getattr(voice, "channel", None), "members", []) if not member.bot]
+        if not humans:
+            await send("You need to be in the voice channel to vote.")
+            return
+        required = max(1, int(len(humans) * MUSIC_VOTE_REQUIRED_RATIO))
+        verb = "skip" if action == "skip" else "leave"
+        vote_msg = await send(
+            f"📊 Vote to {verb}: {required}/{len(humans)} votes needed. "
+            f"React with 👍 to vote, 👎 to cancel."
+        )
+        await asyncio.gather(
+            vote_msg.add_reaction("👍"),
+            vote_msg.add_reaction("👎"),
+        )
+        self.votes[vote_msg.id] = {
+            "guild_id": guild_id,
+            "action": action,
+            "votes": set(),
+            "required": required,
+            "total": len(humans),
+            "starter": starter_id,
+        }
 
     def _cancel_empty_timer(self, guild_id: int):
         task = self.empty_timers.pop(guild_id, None)
@@ -578,7 +857,7 @@ class Music(commands.Cog):
             state["current"] = None
             state["last_played"] = None
             self._clear_resume_markers(state)
-            self._persist()  # wipe the saved state so a restart can't resurrect the kicked session
+            await self._persist()  # wipe the saved state so a restart can't resurrect the kicked session
             self._cancel_empty_timer(guild_id)
         except asyncio.CancelledError:
             pass
@@ -692,6 +971,74 @@ class Music(commands.Cog):
             )
         return entries
 
+    def _soundcloud_playlist_entries(self, playlist_url: str, requester: str) -> list[dict]:
+        """Expand a SoundCloud set/album/playlist into lazy queue entries."""
+        info = _soundcloud_info(playlist_url, flat=True, playlist=True)
+        if not info:
+            return []
+        entries = []
+        for item in info.get("entries") or []:
+            if not item:
+                continue
+            url = item.get("webpage_url") or item.get("original_url") or item.get("url")
+            if not url:
+                continue
+            entries.append(
+                {
+                    "title": item.get("title") or "Unknown",
+                    "url": None,
+                    "duration": max(0, int(item.get("duration") or 0)),
+                    "thumbnail": item.get("thumbnail"),
+                    "uploader": item.get("uploader") or item.get("channel") or "SoundCloud",
+                    "query": url,
+                    "requester": requester,
+                    "soundcloud": True,
+                }
+            )
+        return entries
+
+    def _soundcloud_search_results(self, query: str, limit: int = 5) -> list[dict]:
+        """Search SoundCloud through yt-dlp's public SoundCloud extractor."""
+        info = _soundcloud_info(f"scsearch{limit}:{query}", flat=True)
+        if not info:
+            return []
+        results = []
+        for item in info.get("entries") or []:
+            if not item:
+                continue
+            url = item.get("webpage_url") or item.get("original_url") or item.get("url")
+            if not url:
+                continue
+            results.append(
+                {
+                    "title": item.get("title") or "Unknown",
+                    "url": url,
+                    "duration": max(0, int(item.get("duration") or 0)),
+                    "thumbnail": item.get("thumbnail"),
+                    "sub": item.get("uploader") or item.get("channel") or "",
+                }
+            )
+        return results[:limit]
+
+    def _extract_soundcloud(self, query: str) -> dict | None:
+        """Resolve one SoundCloud URL into the track format used by the queue."""
+        info = _soundcloud_info(query)
+        if not info or info.get("_type") == "playlist":
+            return None
+        stream_url = info.get("url")
+        if not stream_url:
+            return None
+        return {
+            "title": info.get("title") or "Unknown",
+            "url": stream_url,
+            "duration": max(0, int(info.get("duration") or 0)),
+            "thumbnail": info.get("thumbnail"),
+            "uploader": info.get("uploader") or info.get("channel") or "SoundCloud",
+            "query": query,
+            "requester": "Unknown",
+            "soundcloud": True,
+        }
+
     def _youtube_search_results(self, query: str, limit: int = 5) -> list[dict]:
         """Search YouTube and return lightweight result cards (no stream extraction)."""
         results = []
@@ -716,7 +1063,7 @@ class Music(commands.Cog):
     def _spotify_search_results(self, query: str, limit: int = 5) -> list[dict]:
         """Search for tracks via Deezer's public API (no auth) — the closest
         legal metadata match to Spotify's catalogue. Each result maps to the
-        YouTube search string that !play's Spotify path would have used."""
+        YouTube search string that the play command's Spotify path would have used."""
         import requests
         try:
             resp = requests.get(
@@ -774,6 +1121,8 @@ class Music(commands.Cog):
 
     def _extract(self, query: str):
         """Resolve audio info for play/queue. Returns a track dict or None."""
+        if _is_soundcloud_url(query):
+            return self._extract_soundcloud(query)
         yt = self._resolve(query)
         if yt is None:
             return None
@@ -809,7 +1158,8 @@ class Music(commands.Cog):
 
         results: list of dicts with title/sub/duration/thumbnail; how a pick
         becomes a queue entry is decided by `source` ('youtube' queues the
-        video URL, 'spotify' queues the YouTube search string lazily).
+        video URL, 'spotify' queues the YouTube search string lazily, and
+        'soundcloud' queues the SoundCloud URL lazily).
         """
         if ctx.guild is None:
             await ctx.reply("Music only works in a server.", mention_author=False)
@@ -911,6 +1261,17 @@ class Music(commands.Cog):
                 "query": picked["url"],
                 "requester": f"<@{payload.user_id}>",
             }
+        elif session["source"] == "soundcloud":
+            track = {
+                "title": picked["title"],
+                "url": None,
+                "duration": picked.get("duration", 0),
+                "thumbnail": picked.get("thumbnail"),
+                "uploader": picked.get("sub", "SoundCloud"),
+                "query": picked["url"],
+                "requester": f"<@{payload.user_id}>",
+                "soundcloud": True,
+            }
         else:  # spotify: queue the YouTube search string, resolved lazily
             track = {
                 "title": picked["title"],
@@ -974,7 +1335,7 @@ class Music(commands.Cog):
         else:
             shim = _ResumeCtx(self.bot.get_guild(guild_id), voice, self.bot.get_channel(payload.channel_id))
             await self._play_next(shim)
-        self._start_empty_timer(guild_id)
+        await self._start_empty_timer(guild_id)
         return True
 
     async def _handle_track_end(self, ctx):
@@ -983,9 +1344,11 @@ class Music(commands.Cog):
         current = state["current"]
         suppress_loop = state.pop("suppress_loop", False)
 
+        suppress_now_playing = False
         if current is not None and not suppress_loop:
             if state["loop"] == "track":
                 state["queue"].insert(0, current)
+                suppress_now_playing = True
             elif state["loop"] == "queue":
                 state["queue"].append(current)
 
@@ -995,6 +1358,7 @@ class Music(commands.Cog):
         state["started_at"] = None
         state["elapsed"] = 0.0
         state["source"] = None
+        state["suppress_now_playing"] = suppress_now_playing
         await self._play_next(ctx)
 
     async def _play_next(self, ctx, resume_at: float = 0.0, force_track: dict | None = None):
@@ -1059,9 +1423,10 @@ class Music(commands.Cog):
 
         voice.play(source, after=_after)
         state["source"] = source
-        await self._send_now_playing(ctx)
+        if not state.pop("suppress_now_playing", False):
+            await self._send_now_playing(ctx)
 
-    @commands.command(name="join", aliases=["j"])
+    @commands.hybrid_command(name="join", aliases=["j"])
     async def join(self, ctx):
         """Join the voice channel of the command sender."""
         voice = await self._ensure_voice(ctx)
@@ -1069,7 +1434,7 @@ class Music(commands.Cog):
             await ctx.reply(f"🔊 Joined **{voice.channel.name}**.", mention_author=False)
             await self._start_empty_timer(ctx.guild.id)
 
-    @commands.command(name="loop", aliases=["lp"])
+    @commands.hybrid_command(name="loop", aliases=["lp"])
     async def loop(self, ctx, mode: str = "track"):
         """Loop the current track or the whole queue."""
         if ctx.guild is None:
@@ -1086,7 +1451,7 @@ class Music(commands.Cog):
         elif mode == "queue":
             loop_mode = "queue"
         else:
-            await ctx.reply("Usage: `!loop [track|queue]` (or `!loop off` to disable)", mention_author=False)
+            await ctx.reply(f"Usage: `{BOT_PREFIX}loop [track|queue]` (or `{BOT_PREFIX}loop off` to disable)", mention_author=False)
             return
 
         self.get_state(ctx.guild.id)["loop"] = loop_mode
@@ -1097,7 +1462,7 @@ class Music(commands.Cog):
         else:
             await ctx.reply("➡️ Looping disabled.", mention_author=False)
 
-    @commands.command(name="volume", aliases=["v"])
+    @commands.hybrid_command(name="volume", aliases=["v"])
     async def volume(self, ctx, value: str = ""):
         """Show or set playback volume from 0 to 100 percent."""
         if ctx.guild is None:
@@ -1128,8 +1493,8 @@ class Music(commands.Cog):
     async def _enqueue(self, ctx, query: str, insert: bool = False):
         """Resolve a link/search and add it to the queue.
 
-        insert=False appends at the end (!play); insert=True splices right
-        after the currently playing track (!insert). Playlists are expanded
+        insert=False appends at the end (play); insert=True splices right
+        after the currently playing track (insert). Playlists are expanded
         lazily and keep their order starting at the splice point.
         """
         if ctx.guild is None:
@@ -1138,7 +1503,7 @@ class Music(commands.Cog):
 
         if not query.strip():
             cmd = "insert" if insert else "play"
-            await ctx.reply(f"Usage: `!{cmd} <link or search>`", mention_author=False)
+            await ctx.reply(f"Usage: `{BOT_PREFIX}{cmd} <link or search>`", mention_author=False)
             return
 
         if not ctx.author.voice or not ctx.author.voice.channel:
@@ -1159,6 +1524,24 @@ class Music(commands.Cog):
             return
 
         query = query.strip()
+
+        # SoundCloud sets/albums/playlists are expanded lazily so a large
+        # collection does not resolve every stream before playback begins.
+        if _is_soundcloud_playlist_url(query):
+            async with ctx.typing():
+                entries = await asyncio.to_thread(
+                    self._soundcloud_playlist_entries, query, ctx.author.mention
+                )
+            if not entries:
+                await ctx.reply("Couldn't find any tracks in that SoundCloud playlist.", mention_author=False)
+                return
+            playlist_info = await asyncio.to_thread(
+                _soundcloud_info, query, flat=True, playlist=True
+            )
+            playlist_name = (playlist_info or {}).get("title") or "SoundCloud playlist"
+            label = f"📃 **{len(entries)}** tracks from **{playlist_name}** (SoundCloud)"
+            await self._add_entries(ctx, voice, entries, label, label, insert)
+            return
 
         # Spotify links (track/album/playlist) are metadata-only: fetch the
         # tracklist from the embed page and queue YouTube searches for each
@@ -1208,7 +1591,7 @@ class Music(commands.Cog):
             playlist_name = None
             try:
                 import pytubefix as ptf
-                playlist_name = ptf.Playlist(query).title
+                playlist_name = await asyncio.to_thread(lambda: ptf.Playlist(query).title)
             except Exception:
                 pass
             label = f"📃 **{len(entries)}** videos from **{playlist_name or 'YouTube playlist'}**"
@@ -1273,11 +1656,11 @@ class Music(commands.Cog):
                 await ctx.reply(f"{plural_label} — starting at position **{first_pos}**", mention_author=False)
         await self._start_empty_timer(ctx.guild.id)
 
-    @commands.command(name="play", aliases=["p"])
+    @commands.hybrid_command(name="play", aliases=["p"])
     async def play(self, ctx, *, query: str = ""):
-        """Play a song from a link or search. Usage: `!play <link|search>`"""
+        """Play a song from a link or search."""
         if not query.strip():
-            # Bare !play with something paused/recently played acts as resume.
+            # Bare play with something paused/recently played acts as resume.
             voice = ctx.voice_client
             if voice is not None and voice.is_paused():
                 await self.resume(ctx)
@@ -1291,7 +1674,7 @@ class Music(commands.Cog):
                 return
         await self._enqueue(ctx, query, insert=False)
 
-    @commands.command(name="playagain", aliases=["rewind"])
+    @commands.hybrid_command(name="playagain", aliases=["rewind"])
     async def playagain(self, ctx):
         """Replay the last finished song right after the current one."""
         voice = ctx.voice_client
@@ -1312,7 +1695,7 @@ class Music(commands.Cog):
         state["queue"].insert(0, dict(last))
         await ctx.reply(f"⏪ Queued **{last['title']}** again — playing **next**.", mention_author=False)
 
-    @commands.command(name="shuffle", aliases=["mix"])
+    @commands.hybrid_command(name="shuffle", aliases=["mix"])
     async def shuffle(self, ctx):
         """Shuffle the current queue."""
         if ctx.guild is None:
@@ -1329,7 +1712,7 @@ class Music(commands.Cog):
 
     @staticmethod
     def _parse_seek_timestamp(raw: str, current_elapsed: float, duration: int) -> float | None:
-        """Parse a !seek argument into a target position in seconds.
+        """Parse a seek-command argument into a target position in seconds.
 
         Accepts absolute forms (90, 1:30, 1:02:03) and relative forms
         (+30, -15, +1:00) that offset from the current position. Returns
@@ -1354,11 +1737,12 @@ class Music(commands.Cog):
             seconds = current_elapsed + sign * seconds
         return max(0.0, min(float(seconds), float(duration))) if duration > 0 else max(0.0, float(seconds))
 
-    @commands.command(name="seek", aliases=["goto"])
+    @commands.hybrid_command(name="seek", aliases=["goto"])
     async def seek(self, ctx, *, timestamp: str = ""):
         """Jump to a position in the current track (DJ).
 
-        Usage: `!seek 1:23` (absolute), `!seek +30` / `!seek -15` (relative).
+        Usage: "seek 1:23" (absolute), "seek +30" / "seek -15" (relative),
+        prefixed with BOT_PREFIX.
         """
         if ctx.guild is None:
             await ctx.reply("Music only works in a server.", mention_author=False)
@@ -1376,12 +1760,12 @@ class Music(commands.Cog):
         target = self._parse_seek_timestamp(timestamp, elapsed, duration)
         if target is None:
             await ctx.reply(
-                "Usage: `!seek <time>` — e.g. `!seek 1:23` (jump), `!seek +30` / `!seek -15` (relative).",
+                f"Usage: `{BOT_PREFIX}seek <time>` — e.g. `{BOT_PREFIX}seek 1:23` (jump), `{BOT_PREFIX}seek +30` / `{BOT_PREFIX}seek -15` (relative).",
                 mention_author=False,
             )
             return
         if duration and elapsed >= duration - 1:
-            await ctx.reply("The track is already at its end — use `!skip` or `!playagain`.", mention_author=False)
+            await ctx.reply(f"The track is already at its end — use `{BOT_PREFIX}skip` or `{BOT_PREFIX}playagain`.", mention_author=False)
             return
         if duration and target >= duration - 1:
             await ctx.reply(
@@ -1415,7 +1799,7 @@ class Music(commands.Cog):
             # predictable behavior), so just clear the stale paused flag.
             state["paused"] = False
 
-    @commands.command(name="removeduplicates", aliases=["rmdup", "rmduplicate", "rmduplicates"])
+    @commands.hybrid_command(name="removeduplicates", aliases=["rmdup", "rmduplicate", "rmduplicates"])
     async def removeduplicates(self, ctx):
         """Remove duplicate songs from the queue (keeps the first occurrence)."""
         if ctx.guild is None:
@@ -1440,11 +1824,11 @@ class Music(commands.Cog):
         state["queue"][:] = kept
         await ctx.reply(f"🧹 Removed **{removed}** duplicate song(s); **{len(kept)}** remain.", mention_author=False)
 
-    @commands.command(name="search")
+    @commands.hybrid_command(name="search")
     async def search(self, ctx, *, query: str = ""):
-        """Search YouTube and pick a result to queue. Usage: `!search <query>`"""
+        """Search YouTube and pick a result to queue."""
         if not query.strip():
-            await ctx.reply("Usage: `!search <query>`", mention_author=False)
+            await ctx.reply(f"Usage: `{BOT_PREFIX}search <query>`", mention_author=False)
             return
         if ctx.guild is None:
             await ctx.reply("Music only works in a server.", mention_author=False)
@@ -1453,11 +1837,11 @@ class Music(commands.Cog):
             results = await asyncio.to_thread(self._youtube_search_results, query.strip(), 5)
         await self._run_search_picker(ctx, "youtube", results, "YouTube")
 
-    @commands.command(name="searchspotify", aliases=["ssearch", "spotifysearch"])
+    @commands.hybrid_command(name="searchspotify", aliases=["ssearch", "spotifysearch"])
     async def searchspotify(self, ctx, *, query: str = ""):
-        """Search Spotify's catalogue and pick a track to queue. Usage: `!searchspotify <query>`"""
+        """Search Spotify's catalogue and pick a track to queue."""
         if not query.strip():
-            await ctx.reply("Usage: `!searchspotify <query>`", mention_author=False)
+            await ctx.reply(f"Usage: `{BOT_PREFIX}searchspotify <query>`", mention_author=False)
             return
         if ctx.guild is None:
             await ctx.reply("Music only works in a server.", mention_author=False)
@@ -1466,12 +1850,25 @@ class Music(commands.Cog):
             results = await asyncio.to_thread(self._spotify_search_results, query.strip(), 5)
         await self._run_search_picker(ctx, "spotify", results, "Spotify")
 
-    @commands.command(name="insert", aliases=["i"])
+    @commands.hybrid_command(name="searchsoundcloud", aliases=["scsearch", "soundcloudsearch"])
+    async def searchsoundcloud(self, ctx, *, query: str = ""):
+        """Search SoundCloud and pick a track to queue."""
+        if not query.strip():
+            await ctx.reply(f"Usage: `{BOT_PREFIX}searchsoundcloud <query>`", mention_author=False)
+            return
+        if ctx.guild is None:
+            await ctx.reply("Music only works in a server.", mention_author=False)
+            return
+        async with ctx.typing():
+            results = await asyncio.to_thread(self._soundcloud_search_results, query.strip(), 5)
+        await self._run_search_picker(ctx, "soundcloud", results, "SoundCloud")
+
+    @commands.hybrid_command(name="insert", aliases=["i"])
     async def insert(self, ctx, *, query: str = ""):
-        """Insert a song right after the current one. Usage: `!insert <link|search>`"""
+        """Insert a song right after the current one."""
         await self._enqueue(ctx, query, insert=True)
 
-    @commands.command(name="skip", aliases=["next", "s"])
+    @commands.hybrid_command(name="skip", aliases=["next", "s"])
     async def skip(self, ctx):
         """Skip the current track."""
         voice = ctx.voice_client
@@ -1492,32 +1889,14 @@ class Music(commands.Cog):
                 await ctx.reply("Nothing is playing and the queue is empty.", mention_author=False)
             return
 
-        humans = self._get_human_voice_members(ctx)
-        if not humans:
-            await ctx.reply("You need to be in the voice channel to vote.", mention_author=False)
-            return
-
-        required = max(1, int(len(humans) * MUSIC_VOTE_REQUIRED_RATIO))
-        vote_msg = await ctx.reply(
-            f"📊 Vote to skip: {required}/{len(humans)} votes needed. "
-            f"React with 👍 to vote, 👎 to cancel.",
-            mention_author=False,
-        )
-        await asyncio.gather(
-            vote_msg.add_reaction("👍"),
-            vote_msg.add_reaction("👎"),
+        await self._start_vote(
+            ctx.guild.id,
+            "skip",
+            ctx.author.id,
+            lambda content: ctx.reply(content, mention_author=False),
         )
 
-        self.votes[vote_msg.id] = {
-            "guild_id": ctx.guild.id,
-            "action": "skip",
-            "votes": set(),
-            "required": required,
-            "total": len(humans),
-            "starter": ctx.author.id,
-        }
-
-    @commands.command(name="leave", aliases=["l", "stop", "disconnect", "dc"])
+    @commands.hybrid_command(name="leave", aliases=["l", "stop", "disconnect", "dc"])
     async def stop(self, ctx):
         """Stop playback, clear the queue, and leave the voice channel."""
         voice = ctx.voice_client
@@ -1536,37 +1915,19 @@ class Music(commands.Cog):
             self._reset_playback_state(state)
             state["last_played"] = None
             self._clear_resume_markers(state)
-            self._persist()  # wipe the saved state now so a restart can't resurrect the cleared queue
+            await self._persist()  # wipe the saved state now so a restart can't resurrect the cleared queue
             await ctx.reply("👋 Left the voice channel and cleared the queue.", mention_author=False)
             self._cancel_empty_timer(ctx.guild.id)
             return
 
-        humans = self._get_human_voice_members(ctx)
-        if not humans:
-            await ctx.reply("You need to be in the voice channel to vote.", mention_author=False)
-            return
-
-        required = max(1, int(len(humans) * MUSIC_VOTE_REQUIRED_RATIO))
-        vote_msg = await ctx.reply(
-            f"📊 Vote to leave: {required}/{len(humans)} votes needed. "
-            f"React with 👍 to vote, 👎 to cancel.",
-            mention_author=False,
-        )
-        await asyncio.gather(
-            vote_msg.add_reaction("👍"),
-            vote_msg.add_reaction("👎"),
+        await self._start_vote(
+            ctx.guild.id,
+            "leave",
+            ctx.author.id,
+            lambda content: ctx.reply(content, mention_author=False),
         )
 
-        self.votes[vote_msg.id] = {
-            "guild_id": ctx.guild.id,
-            "action": "leave",
-            "votes": set(),
-            "required": required,
-            "total": len(humans),
-            "starter": ctx.author.id,
-        }
-
-    @commands.command(name="queue", aliases=["q"])
+    @commands.hybrid_command(name="queue", aliases=["q"])
     async def queue(self, ctx, action: str = "", first: str = "", second: str = ""):
         """Show or manage the queue. Management actions require DJ access."""
         if ctx.guild is None:
@@ -1589,7 +1950,7 @@ class Music(commands.Cog):
                 index = int(first) - 1
                 track = state["queue"][index]
             except (ValueError, IndexError):
-                await ctx.reply("Usage: `!queue remove <position>`.", mention_author=False)
+                await ctx.reply(f"Usage: `{BOT_PREFIX}queue remove <position>`.", mention_author=False)
                 return
             state["queue"].pop(index)
             await ctx.reply(f"🗑️ Removed **{track['title']}** from the queue.", mention_author=False)
@@ -1608,7 +1969,7 @@ class Music(commands.Cog):
                 track = state["queue"].pop(old_index)
                 state["queue"].insert(new_index, track)
             except (ValueError, IndexError):
-                await ctx.reply("Usage: `!queue move <from-position> <to-position>`.", mention_author=False)
+                await ctx.reply(f"Usage: `{BOT_PREFIX}queue move <from-position> <to-position>`.", mention_author=False)
                 return
             await ctx.reply(f"↕️ Moved **{track['title']}** to queue position **{new_index + 1}**.", mention_author=False)
             return
@@ -1621,23 +1982,20 @@ class Music(commands.Cog):
             return
 
         if action:
-            await ctx.reply("Usage: `!queue`, `!queue remove <position>`, `!queue move <from> <to>`, `!queue clear`, or `!queue shuffle`.", mention_author=False)
+            await ctx.reply(
+                f"Usage: `{BOT_PREFIX}queue`, `{BOT_PREFIX}queue remove <position>`, "
+                f"`{BOT_PREFIX}queue move <from> <to>`, `{BOT_PREFIX}queue clear`, or `{BOT_PREFIX}queue shuffle`.",
+                mention_author=False,
+            )
             return
 
-        embed = self._now_playing_embed(ctx.guild.id)
-        if embed is not None:
-            await ctx.reply(embed=embed, mention_author=False)
-        if not state["queue"]:
-            await ctx.send("Queue is empty.")
-            return
-        lines = [f"**Up next ({len(state['queue'])}):**"]
-        for i, track in enumerate(state["queue"], start=1):
-            duration = f" ({self._fmt_duration(track['duration'])})" if track.get("duration") else ""
-            requester = f" • {track.get('requester', 'Unknown')}" if track.get("requester") else ""
-            lines.append(f"**{i}.** {track['title']}{duration}{requester}")
-        await ctx.send(embed=discord.Embed(description="\n".join(lines), color=0x00AAFF))
+        await ctx.reply(
+            embed=self._queue_embed(ctx.guild.id),
+            view=MusicControlView(self, ctx.guild.id, queue_view=True),
+            mention_author=False,
+        )
 
-    @commands.command(name="pause", aliases=["ps"])
+    @commands.hybrid_command(name="pause", aliases=["ps"])
     async def pause(self, ctx):
         """Pause the current track."""
         if not await self._require_dj(ctx):
@@ -1653,7 +2011,7 @@ class Music(commands.Cog):
         else:
             await ctx.reply("Nothing is playing.", mention_author=False)
 
-    @commands.command(name="resume", aliases=["unpause"])
+    @commands.hybrid_command(name="resume", aliases=["unpause"])
     async def resume(self, ctx):
         """Resume the paused track."""
         if not await self._require_dj(ctx):
@@ -1667,7 +2025,7 @@ class Music(commands.Cog):
             await ctx.reply("▶️ Resumed.", mention_author=False)
         else:
             await ctx.reply("Nothing is paused.", mention_author=False)
-    @commands.command(name="nowplaying", aliases=["np"])
+    @commands.hybrid_command(name="nowplaying", aliases=["np"])
     async def nowplaying(self, ctx):
         """Show what's currently playing as a detailed embed."""
         if ctx.guild is None:
@@ -1679,54 +2037,55 @@ class Music(commands.Cog):
             return
         await ctx.reply(embed=embed, mention_author=False)
 
-    @commands.command(name="dj")
+    @commands.hybrid_command(name="dj")
     @commands.has_permissions(manage_guild=True)
     async def set_dj(self, ctx, role: discord.Role):
-        """Set the DJ role for this server. Usage: `!dj <role>`"""
+        """Set the DJ role for this server."""
         self.dj_roles[ctx.guild.id] = role.id
-        _save_music_settings(self.dj_roles)
+        await asyncio.to_thread(_save_music_settings, self.dj_roles)
         await ctx.reply(f"🎧 DJ role set to **{role.name}**.", mention_author=False)
 
-    @commands.command(name="help")
+    @commands.hybrid_command(name="help")
     async def music_help(self, ctx):
         """Show all music commands."""
         embed = discord.Embed(
             title="🎵 Music Bot Commands",
-            description=f"Prefix: `!`\nUse `!help <command>` for details.",
+            description=f"Prefix: `{BOT_PREFIX}`\nUse `{BOT_PREFIX}help <command>` for details.",
             color=0x00ff00,
         )
         embed.add_field(
             name="Playback",
-            value="`!play` / `!p` — Play a song\n"
-                  "`!search` — Search YouTube\n"
-                  "`!searchspotify` / `!ssearch` — Search Spotify\n"
-                  "`!insert` / `!i` — Queue next\n"
-                  "`!skip` / `!s` — Skip\n"
-                  "`!pause` / `!ps` — Pause\n"
-                  "`!resume` — Resume\n"
-                  "`!seek` / `!goto` — Seek position\n"
-                  "`!playagain` / `!rewind` — Replay last song",
+            value=f"`{BOT_PREFIX}play` / `{BOT_PREFIX}p` — Play a song\n"
+                  f"`{BOT_PREFIX}search` — Search YouTube\n"
+                  f"`{BOT_PREFIX}searchspotify` / `{BOT_PREFIX}ssearch` — Search Spotify\n"
+                  f"`{BOT_PREFIX}searchsoundcloud` / `{BOT_PREFIX}scsearch` — Search SoundCloud\n"
+                  f"`{BOT_PREFIX}insert` / `{BOT_PREFIX}i` — Queue next\n"
+                  f"`{BOT_PREFIX}skip` / `{BOT_PREFIX}s` — Skip\n"
+                  f"`{BOT_PREFIX}pause` / `{BOT_PREFIX}ps` — Pause\n"
+                  f"`{BOT_PREFIX}resume` — Resume\n"
+                  f"`{BOT_PREFIX}seek` / `{BOT_PREFIX}goto` — Seek position\n"
+                  f"`{BOT_PREFIX}playagain` / `{BOT_PREFIX}rewind` — Replay last song",
             inline=False,
         )
         embed.add_field(
             name="Queue",
-            value="`!queue` / `!q` — Show queue\n"
-                  "`!shuffle` / `!mix` — Shuffle\n"
-                  "`!removeduplicates` / `!rmdup` — Remove dupes",
+            value=f"`{BOT_PREFIX}queue` / `{BOT_PREFIX}q` — Show queue\n"
+                  f"`{BOT_PREFIX}shuffle` / `{BOT_PREFIX}mix` — Shuffle\n"
+                  f"`{BOT_PREFIX}removeduplicates` / `{BOT_PREFIX}rmdup` — Remove dupes",
             inline=False,
         )
         embed.add_field(
             name="Voice",
-            value="`!join` / `!j` — Join voice\n"
-                  "`!leave` / `!dc` — Leave voice\n"
-                  "`!loop` / `!lp` — Loop track/queue\n"
-                  "`!nowplaying` / `!np` — Now playing\n"
-                  "`!volume` / `!v` — Set volume",
+            value=f"`{BOT_PREFIX}join` / `{BOT_PREFIX}j` — Join voice\n"
+                  f"`{BOT_PREFIX}leave` / `{BOT_PREFIX}dc` — Leave voice\n"
+                  f"`{BOT_PREFIX}loop` / `{BOT_PREFIX}lp` — Loop track/queue\n"
+                  f"`{BOT_PREFIX}nowplaying` / `{BOT_PREFIX}np` — Now playing\n"
+                  f"`{BOT_PREFIX}volume` / `{BOT_PREFIX}v` — Set volume",
             inline=False,
         )
         embed.add_field(
             name="Admin",
-            value="`!dj <role>` — Set DJ role",
+            value=f"`{BOT_PREFIX}dj <role>` — Set DJ role",
             inline=False,
         )
         await ctx.reply(embed=embed, mention_author=False)
@@ -1816,7 +2175,7 @@ class Music(commands.Cog):
             # Debounced: discord.py handles voice reconnects internally (region
             # moves, websocket drops) and during them the bot briefly reports
             # "no channel" (and even a not-connected client) while audio keeps
-            # playing. Wiping immediately used to blank !np/!q mid-song, so
+            # playing. Wiping immediately used to blank np/queue mid-song, so
             # only treat it as a real kick if we're still gone 10s later.
             self._cancel_kick_check(member.guild.id)
             self.kick_checks[member.guild.id] = asyncio.create_task(

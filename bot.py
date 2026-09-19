@@ -18,6 +18,18 @@ class MusicBot(commands.Bot):
     async def setup_hook(self):
         await self.load_extension("music")
 
+        # Sync globally by default. Set DISCORD_GUILD_ID for immediate updates
+        # while developing; global Discord commands can take up to an hour to appear.
+        guild_id = os.getenv("DISCORD_GUILD_ID")
+        if guild_id:
+            guild = discord.Object(id=int(guild_id))
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            print(f"[OK] Synced {len(synced)} slash commands to guild {guild_id}")
+        else:
+            synced = await self.tree.sync()
+            print(f"[OK] Synced {len(synced)} global slash commands")
+
 
 bot = MusicBot(command_prefix=BOT_PREFIX, intents=intents)
 bot.help_command = None

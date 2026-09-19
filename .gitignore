@@ -17,6 +17,8 @@ env/
 .env.*.local
 
 # Discord bot runtime
+thy874vn.py
+run-all.bat
 bot.db
 bot.db-shm
 bot.db-wal
@@ -47,3 +49,4 @@ desktop.ini
 *.pem
 *.p12
 *.pfx
+/.freebuff
