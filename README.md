@@ -52,22 +52,22 @@ run.bat
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `!play` | `p` | Play a YouTube track or search |
-| `!search` | — | Search YouTube and pick a result |
-| `!insert` | `i` | Queue a song to play next |
-| `!pause` | `ps` | Pause playback |
-| `!resume` | — | Resume playback |
-| `!skip` | `s` | Skip current track |
-| `!seek` | `goto` | Jump to a position in the track |
-| `!queue` | `q` | Show/manage the queue |
-| `!nowplaying` | `np` | Show current track info |
-| `!loop` | `lp` | Loop track or queue |
-| `!shuffle` | `mix` | Shuffle the queue |
-| `!leave` | `dc` | Disconnect from voice |
-| `!dj` | — | Set the DJ role for this server |
-| `!playagain` | `rewind` | Replay the last song |
-| `!removeduplicates` | `rmdup` | Remove duplicate songs from the queue |
-| `!help` | — | Show all commands |
+| `.play` | `p` | Play a YouTube track or search |
+| `.search` | — | Search YouTube and pick a result |
+| `.insert` | `i` | Queue a song to play next |
+| `.pause` | `ps` | Pause playback |
+| `.resume` | — | Resume playback |
+| `.skip` | `s` | Skip current track |
+| `.seek` | `goto` | Jump to a position in the track |
+| `.queue` | `q` | Show/manage the queue |
+| `.nowplaying` | `np` | Show current track info |
+| `.loop` | `lp` | Loop track or queue |
+| `.shuffle` | `mix` | Shuffle the queue |
+| `.leave` | `dc` | Disconnect from voice |
+| `.dj` | — | Set the DJ role for this server |
+| `.playagain` | `rewind` | Replay the last song |
+| `.removeduplicates` | `rmdup` | Remove duplicate songs from the queue |
+| `.help` | — | Show all commands |
 
 ## Customizing Commands
 
