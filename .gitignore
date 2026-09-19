@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env.local
+.env.*.local
+
+# Discord bot runtime
+bot.db
+bot.db-shm
+bot.db-wal
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# Secrets
+.env
+*.secret
+*.key
+*.pem
+*.p12
+*.pfx

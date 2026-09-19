@@ -1,0 +1,6 @@
+discord.py>=2.7
+pytubefix
+PyNaCl
+python-dotenv
+requests
+msgspec
