@@ -63,6 +63,8 @@ The default command prefix is `.`, and can be changed with `BOT_PREFIX` in `.env
 | `.play` | `p` | Play a YouTube/SoundCloud track, search, or playlist |
 | `.search` | — | Search YouTube and pick a result |
 | `.searchsoundcloud` | `scsearch` | Search SoundCloud and pick a result |
+| `.play` | `p` | Play a YouTube track or search |
+| `.search` | — | Search YouTube and pick a result |
 | `.insert` | `i` | Queue a song to play next |
 | `.pause` | `ps` | Pause playback |
 | `.resume` | — | Resume playback |
